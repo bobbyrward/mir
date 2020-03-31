@@ -1,4 +1,4 @@
-use git2::{build::RepoBuilder, Cred, CredentialType, Error, FetchOptions, RemoteCallbacks};
+use git2::{build::RepoBuilder, Cred, Error, FetchOptions, RemoteCallbacks};
 use gitlab::Gitlab;
 use indicatif::{ProgressBar, ProgressStyle};
 use num;
@@ -6,6 +6,7 @@ use rpassword;
 use structopt::StructOpt;
 
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -45,13 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let access_level = format!("{}", num::clamp(args.access_level, 1, 5) * 10);
     let password = match args.personal_access_token {
         Some(p) => p,
-        None => rpassword::prompt_password_stdout("Enter GitLab personal access token: ")?
+        None => rpassword::prompt_password_stdout("Enter GitLab personal access token: ")?,
     };
     let gitlab = Gitlab::new(&args.host, &password)?;
     let user = gitlab.current_user()?;
     let groups = gitlab.groups(&[("min_access_level", &access_level)])?;
     let projects = gitlab.projects(&[("min_access_level", &access_level)])?;
-    let mut namespaces = groups.iter().map(|ref g| &g.full_path).collect::<HashSet<_>>();
+    let mut namespaces = groups
+        .iter()
+        .map(|ref g| &g.full_path)
+        .collect::<HashSet<_>>();
     namespaces.insert(&user.username);
     for n in namespaces {
         let namespace = format!("{}/{}", args.destination, n);
@@ -60,16 +64,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.clone {
         let progress_bar = ProgressBar::new(0);
-        progress_bar.set_style(ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {msg:18}: {bar:40.magenta/red} {pos}/{len}")
-            .progress_chars("##-"));
+        progress_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {msg:18}: {bar:40.magenta/red} {pos}/{len}")
+                .progress_chars("##-"),
+        );
         let mut remote_callbacks = RemoteCallbacks::new();
         remote_callbacks
-            .credentials(|_, _, credential_type| {
-                match credential_type {
-                    CredentialType::USER_PASS_PLAINTEXT => Cred::userpass_plaintext(&user.username, &password),
-                    _ => Err(Error::from_str(&format!("Unsupported requested credential type '{:?}'", credential_type))),
+            .credentials(|_, username_from_url, allowed_types| {
+                if allowed_types.is_user_pass_plaintext() {
+                    return Cred::userpass_plaintext(&user.username, &password);
                 }
+
+                if allowed_types.is_ssh_key() {
+                    return Cred::ssh_key(
+                        username_from_url
+                            .ok_or_else(|| Error::from_str("No username in URL for SSH"))?,
+                        None,
+                        Path::new(&format!(
+                            "{}/.ssh/id_rsa",
+                            env::var("HOME").map_err(|error| Error::from_str(&format!(
+                                "Can't find SSH directory: $HOME {}",
+                                error
+                            )))?
+                        )),
+                        None,
+                    );
+                }
+
+                Err(Error::from_str(&format!(
+                    "Unsupported requested credential type '{:?}'",
+                    allowed_types
+                )))
             })
             .transfer_progress(|p| {
                 if p.received_objects() < p.total_objects() {
@@ -89,11 +115,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repo_builder.fetch_options(fetch_options);
         for p in projects {
             let namespace = format!("{}/{}/{}", args.destination, p.namespace.full_path, p.name);
-            fs::create_dir_all(&namespace).expect(&format!("failed to create the directory '{}'", namespace));
-            if let Ok(_) = repo_builder.clone(&p.http_url_to_repo, Path::new(&namespace)) {
-                progress_bar.println(format!("Cloning into '{}'...", namespace));
-            } else {
-                progress_bar.println(format!("Failed to clone into '{}', it may already exist.\n", namespace));
+            fs::create_dir_all(&namespace)
+                .expect(&format!("failed to create the directory '{}'", namespace));
+            match repo_builder.clone(&p.http_url_to_repo, Path::new(&namespace)) {
+                Ok(_) => progress_bar.println(format!("Cloning into '{}'...", namespace)),
+                Err(error) => progress_bar
+                    .println(format!("Failed to clone into '{}': {}\n", namespace, error)),
             }
             progress_bar.finish();
         }
