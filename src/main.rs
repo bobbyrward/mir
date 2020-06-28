@@ -1,4 +1,4 @@
-use git2::{build::RepoBuilder, Cred, CredentialType, Error, FetchOptions, RemoteCallbacks};
+use git2::{build::RepoBuilder, Cred, Error, FetchOptions, RemoteCallbacks};
 use gitlab::Gitlab;
 use indicatif::{ProgressBar, ProgressStyle};
 use num;
@@ -6,6 +6,7 @@ use rpassword;
 use structopt::StructOpt;
 
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -38,6 +39,9 @@ struct CliArgs {
 	// /// Verbose mode (-v, -vv, -vvv, etc.)
 	// #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
 	// verbose: u8,
+	/// SSH private key
+	#[structopt(short = "s", long = "ssh-private-key", default_value = "~/.ssh/id_rsa")]
+	ssh_private_key: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,13 +73,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				.progress_chars("##-"),
 		);
 		let mut remote_callbacks = RemoteCallbacks::new();
+		let ssh_private_key = args.ssh_private_key;
 		remote_callbacks
-			.credentials(|_, _, credential_type| match credential_type {
-				CredentialType::USER_PASS_PLAINTEXT => Cred::userpass_plaintext(&user.username, &password),
-				_ => Err(Error::from_str(&format!(
+			.credentials(move |_, username_from_url, allowed_types| {
+				if allowed_types.is_user_pass_plaintext() {
+					return Cred::userpass_plaintext(&user.username, &password);
+				}
+
+				if allowed_types.is_ssh_key() {
+					let mut private_key = Path::new(&ssh_private_key).to_path_buf();
+					if let Ok(suffix) = private_key.strip_prefix("~") {
+						private_key = env::home_dir()
+							.ok_or_else(|| {
+								Error::from_str("Can't find home directory to locate SSH private key")
+							})?
+							.join(suffix);
+					}
+
+					return Cred::ssh_key(
+						username_from_url.ok_or_else(|| Error::from_str("No username in URL for SSH"))?,
+						None,
+						&private_key,
+						None,
+					);
+				}
+
+				Err(Error::from_str(&format!(
 					"Unsupported requested credential type '{:?}'",
-					credential_type
-				))),
+					allowed_types
+				)))
 			})
 			.transfer_progress(|p| {
 				if p.received_objects() < p.total_objects() {
@@ -97,13 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			let namespace = format!("{}/{}/{}", args.destination, p.namespace.full_path, p.name);
 			fs::create_dir_all(&namespace)
 				.expect(&format!("failed to create the directory '{}'", namespace));
-			if let Ok(_) = repo_builder.clone(&p.http_url_to_repo, Path::new(&namespace)) {
-				progress_bar.println(format!("Cloning into '{}'...", namespace));
-			} else {
-				progress_bar.println(format!(
-					"Failed to clone into '{}', it may already exist.\n",
-					namespace
-				));
+			match repo_builder.clone(&p.http_url_to_repo, Path::new(&namespace)) {
+				Ok(_) => progress_bar.println(format!("Cloning into '{}'...", namespace)),
+				Err(error) => {
+					progress_bar.println(format!("Failed to clone into '{}': {}\n", namespace, error))
+				}
 			}
 			progress_bar.finish();
 		}
